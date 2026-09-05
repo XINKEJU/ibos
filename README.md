@@ -309,6 +309,38 @@ Edge「另存为」格式选择导致。`.html + _files` 与 `.mhtml` 单文件�
 
 ---
 
+## 构建自包含 .app（py2app）
+
+默认发布的 `dist/IBOS查询助手.app` 是**完全自包含**的：内嵌 Python 解释器 + 全部第三方依赖（pyautogui / pyobjc / Pillow / bs4 / openpyxl …），不依赖任何外部 Python 或项目目录。换机器、升级系统后把 .app 拷过去双击即可运行。
+
+### 构建环境要求
+- macOS 11+，且使用 **Framework 版 Python 3.13**（python.org 官方安装包自带 Tcl/Tk，否则打出的 .app 内 Tk 无法启动）
+- 已安装 py2app：`python3 -m pip install py2app`
+
+### 构建命令
+```bash
+# 方式一: 脚本(自动清缓存、去除 quarantine 隔离标记)
+./build_app.sh
+
+# 方式二: 手动
+python3 setup.py py2app
+# 未签名 .app 需去除 Gatekeeper 隔离标记, 否则双击会被拦截
+xattr -dr com.apple.quarantine "dist/IBOS查询助手.app"
+```
+产物：`dist/IBOS查询助手.app`（约 100MB，不入库，由 .gitignore 排除）。
+
+### 关键实现
+- **数据目录解耦**：打包模式下 `BASE` 指向 `~/Documents/ibos`（`gui/app.py` 的 `_resolve_base`），与源码彻底解耦；首次启动用 `config.example.json` 模板自动初始化 `config.json` / 名单.txt / 订单号.txt / 导出结果/，**绝不覆盖已有文件**。换到新机器首次运行即自动建好数据目录。
+- **依赖收集**：`setup.py` 显式 `packages` / `includes` 业务包与 pyobjc 绑定；`excludes` 排除无关污染包（numpy / matplotlib / PyQt6 / PyInstaller 等——构建环境若残留这些，py2app 依赖扫描会崩溃或把体积撑到数百 MB）。
+- **资源内嵌**：`assets/AppIcon.icns` `config.example.json` `使用说明.txt` 经 `resources` 打入 `Contents/Resources`，代码用 `_resource_path()` 定位（py2app 会把 resources 扁平化到 Resources 根）。
+- **未签名**：macOS 11+ 对未签名 .app 有 Gatekeeper 拦截。首次用访达「右键 → 打开」一次，或 `xattr -dr com.apple.quarantine` 去除隔离标记即可。
+
+### 自定义
+- 改图标：`python3 tools/make_icon.py` 重新生成，更新 `assets/AppIcon.icns` 后重建。
+- 改版本：编辑 `setup.py` 的 `plist` 中 `CFBundleShortVersionString` / `CFBundleVersion`。
+
+---
+
 ## 开发
 
 ```bash

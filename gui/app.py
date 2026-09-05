@@ -13,7 +13,83 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def _is_frozen() -> bool:
+    """是否由 py2app 打包为自包含 .app(sys.frozen 由 py2app 设置)。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _resolve_base() -> str:
+    """数据/工作目录(config.json、名单、导出结果、日志所在)。
+
+    开发模式: 项目根目录(gui/app.py 的上两级)。
+    打包模式(py2app): ~/Documents/ibos —— 与源码彻底解耦,换机器或升级系统后首次
+        运行自动创建,不依赖任何外部 Python 或项目目录,真正实现「自包含不失效」。
+    """
+    here = os.path.abspath(__file__)
+    if _is_frozen() and "Contents/Resources" in here:
+        work = os.path.expanduser("~/Documents/ibos")
+        try:
+            os.makedirs(work, exist_ok=True)
+        except OSError:
+            pass
+        return work
+    return os.path.dirname(os.path.dirname(here))
+
+
+def _resource_path(name: str) -> str:
+    """定位随 .app 打包的静态资源(图标/配置模板/使用说明)。
+
+    打包模式: 优先取 Contents/Resources。py2app 会把 resources 列表里的文件
+        扁平化拷贝到 Resources 根(去掉源子目录前缀, 如 assets/AppIcon.png →
+        Resources/AppIcon.png), 故先按原样找, 再按 basename 找。
+    开发模式: 取项目目录下的同名文件。
+    """
+    if _is_frozen():
+        base = os.path.join(os.path.dirname(sys.executable), "..", "Resources")
+        cand = os.path.normpath(os.path.join(base, name))
+        if os.path.exists(cand):
+            return cand
+        cand2 = os.path.join(base, os.path.basename(name))  # py2app 扁平化回退
+        if os.path.exists(cand2):
+            return cand2
+    return os.path.join(BASE, name)
+
+
+def _ensure_data_dir() -> None:
+    """打包模式首次启动: 用资源里的模板初始化 ~/Documents/ibos 数据目录。
+
+    仅当目标文件「不存在」时才创建/拷贝,绝不覆盖用户已有数据。
+    开发模式不调用 —— 数据本就在项目目录,无需初始化。
+    """
+    if not _is_frozen():
+        return
+    import shutil
+    os.makedirs(BASE, exist_ok=True)
+    cfg_path = os.path.join(BASE, "config.json")
+    if not os.path.exists(cfg_path):
+        tmpl = _resource_path("config.example.json")
+        if os.path.exists(tmpl):
+            try:
+                shutil.copy(tmpl, cfg_path)
+            except OSError:
+                pass
+    for fn in ("名单.txt", "订单号.txt"):
+        p = os.path.join(BASE, fn)
+        if not os.path.exists(p):
+            try:
+                open(p, "w", encoding="utf-8").close()
+            except OSError:
+                pass
+    try:
+        os.makedirs(os.path.join(BASE, "导出结果"), exist_ok=True)
+    except OSError:
+        pass
+
+
+BASE = _resolve_base()
+# 打包模式自动初始化数据目录;开发模式数据本就在项目目录,跳过
+_ensure_data_dir()
+
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
@@ -746,7 +822,7 @@ class App:
                             "版本 1.0")
 
     def _show_help(self):
-        path = os.path.join(BASE, "使用说明.txt")
+        path = _resource_path("使用说明.txt")
         if os.path.exists(path):
             subprocess.run(["open", path], check=False)
         else:

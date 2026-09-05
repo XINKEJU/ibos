@@ -34,3 +34,10 @@ __pycache__/
 
 # 图标中间产物(由 tools/make_icon.py 生成, 最终产物为 AppIcon.icns)
 assets/AppIcon.iconset/
+
+# ===========================================================
+# py2app 构建产物(自包含 .app 体积大, 不入库; 构建脚本 setup.py/build_app.sh 入库)
+# ===========================================================
+dist/
+build/
+build*.log
