@@ -37,7 +37,13 @@
   "save_screenshots": false,
   "verify_saved": true,
   "auto_export_excel": true,
-  "stop_on_error": true,
+  "max_consecutive_failures": 10,
+  "stop_on_error": false,
+  "recovery_poll_s": 10,
+  "pause_on_intervention": true,
+  "intervention_check": "auto",
+  "resume_idle_s": 5.0,
+  "intervention_wait_timeout_s": 0,
   "resume_enabled": true,
   "log_max_mb": 5
 }

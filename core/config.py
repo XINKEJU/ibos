@@ -63,7 +63,24 @@ DEFAULT = {
     "verify_saved": True,
     # 查询结束后自动解析保存的网页并生成 Excel(含查询报告)
     "auto_export_excel": True,
-    "stop_on_error": True,
+    # ---- 错误容忍(不停止策略)----
+    # 单条查询失败默认跳过并继续;连续失败达该次数(疑似页面结构变化/登录失效)才停止,
+    # 避免单次网络抖动导致整批中断。设为 1 即"任何失败都停"(不推荐无人值守场景)
+    "max_consecutive_failures": 10,
+    # 兼容旧配置:true=任一失败立即停止(不推荐);false=走 max_consecutive_failures 熔断
+    "stop_on_error": False,
+    # 致命错误(如 Edge 被关闭)后,每隔 recovery_poll_s 秒检查一次环境是否恢复;
+    # 恢复后自动重试当前条,不前进索引(无限等待,直到恢复或点「停止」)
+    "recovery_poll_s": 10,
+    # ---- 用户介入守卫(无人值守安全核心)----
+    # 有人使用电脑(动鼠标/键盘/切窗)时立即暂停所有操作,人离开后自动恢复,不与人抢设备
+    "pause_on_intervention": True,
+    # 检测模式: auto=三信号融合 | mouse=仅鼠标漂移 | frontmost=仅前台应用 | off=关闭
+    "intervention_check": "auto",
+    # 人离开多少秒后自动恢复运行(秒);过小可能在人抖腿时误恢复,过大则人走后空等
+    "resume_idle_s": 5.0,
+    # 暂停后最长等待时间(秒);0=无限等待人工,直到人离开或点「停止」(推荐无人值守)
+    "intervention_wait_timeout_s": 0,
     "resume_enabled": True,
     # 运行日志超过该大小(MB)后自动轮转归档
     "log_max_mb": 5

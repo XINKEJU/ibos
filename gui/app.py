@@ -264,6 +264,16 @@ class App:
                         self.bar["value"] = done / max(total, 1) * 100
                         if self.mini:
                             self.mini_prog.config(text=f"{done} / {total}")
+            # 同步用户介入守卫状态到迷你条(有人接手→显示已暂停)
+            auto = getattr(self, "_last_auto", None)
+            if self.mini and auto is not None and getattr(auto, "guard", None):
+                gs = getattr(auto, "guard_state", "running")
+                if gs == "paused":
+                    self.mini_lbl.config(text="⏸ 已暂停(等待人工)")
+                    self.mini_pause_btn.config(text="继续")
+                else:
+                    self.mini_lbl.config(text="查询运行中…")
+                    self.mini_pause_btn.config(text="暂停")
         except queue.Empty:
             pass
         self.root.after(120, self._poll_queue)
@@ -547,6 +557,25 @@ class App:
             self._log("WARN", "停止指令已发送(处理完当前姓名后停止)")
             if self.mini:
                 self.mini_btn.config(state="disabled")
+                if hasattr(self, "mini_pause_btn"):
+                    self.mini_pause_btn.config(state="disabled")
+
+    def _toggle_pause(self):
+        """迷你条「暂停 / 继续」按钮:手动请求守卫暂停或解除暂停。
+
+        暂停生效于下一次原子操作前(不强行打断正在进行的保存/输入),安全且不抢设备。
+        """
+        auto = getattr(self, "_last_auto", None)
+        guard = getattr(auto, "guard", None) if auto else None
+        if guard is None:
+            return
+        if guard.paused or guard._manual_pause:
+            guard.clear_pause()
+            auto.guard_state = "running"
+            self._log("INFO", "已解除暂停,下一操作前恢复运行")
+        else:
+            guard.request_pause()
+            self._log("INFO", "已发送暂停指令,下一操作前生效(有人接手时也会自动暂停)")
 
     def _on_run_done(self):
         self.running = False
@@ -597,19 +626,25 @@ class App:
             my = min(40, sh - 120)
         except Exception:
             mx, my = 8, 40
-        self.mini.geometry(f"250x104+{mx}+{my}")
+        self.mini.geometry(f"252x128+{mx}+{my}")
         mf = tk.Frame(self.mini, bg=C_CARD,
                       highlightbackground=C_BORDER, highlightthickness=1)
         mf.pack(fill="both", expand=True)
         self.mini_lbl = tk.Label(mf, text="查询运行中…", bg=C_CARD, fg=C_TEXT,
                                  font=(FONT, 12, "bold"))
-        self.mini_lbl.pack(pady=(10, 1))
+        self.mini_lbl.pack(pady=(8, 1))
         self.mini_prog = tk.Label(mf, text=f"进度 0 / {total}", bg=C_CARD,
                                   fg=C_ACCENT, font=(FONT_MONO, 10))
         self.mini_prog.pack()
-        self.mini_btn = self._mk_btn(mf, "停止", self.request_stop,
-                                     kind="danger", font_size=11, padx=16, pady=3)
-        self.mini_btn.pack(pady=(6, 8))
+        # 按钮行:暂停/继续 + 停止
+        mb = tk.Frame(mf, bg=C_CARD)
+        mb.pack(pady=(6, 8))
+        self.mini_pause_btn = self._mk_btn(mb, "暂停", self._toggle_pause,
+                                           kind="plain", font_size=11, padx=14, pady=3)
+        self.mini_pause_btn.pack(side="left", padx=(0, 6))
+        self.mini_btn = self._mk_btn(mb, "停止", self.request_stop,
+                                     kind="danger", font_size=11, padx=14, pady=3)
+        self.mini_btn.pack(side="left")
         # 支持拖动
         self.mini.bind("<ButtonPress-1>", self._drag_start)
         self.mini.bind("<B1-Motion>", self._drag_move)

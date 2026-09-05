@@ -17,6 +17,7 @@ import pyautogui
 import pyperclip
 
 from .human import Human
+from .guard import InterventionGuard, InterventionPause, InterventionAbort
 from . import mac_perms
 
 _DIALOG_KEYS = ("保存", "另存", "Save", "saved")
@@ -41,6 +42,14 @@ class SaveError(RuntimeError):
         self.no_retry = no_retry
 
 
+class FatalError(RuntimeError):
+    """致命错误:不解决就无法继续(如 Edge 被关闭、导出目录不可写)。
+
+    与 SaveError 的区别:SaveError 只影响当前这一条,可跳过继续;
+    FatalError 影响整批任务,默认进入「等待人工恢复」而不是直接终止整个批次。
+    """
+
+
 class IbosAutomation:
     def __init__(self, cfg, log, stop_event):
         self.cfg = cfg
@@ -52,8 +61,13 @@ class IbosAutomation:
             self._stopped = lambda: False
         else:
             self._stopped = stop_event
+        # 用户介入守卫:检测到有人使用电脑时暂停全部操作,空闲后自动恢复
+        self.guard = InterventionGuard(cfg, log, stop_event,
+                                       on_state=self._on_guard_state)
+        self.guard_state = "idle"        # idle | running | paused(供 GUI 轮询显示)
         self.h = Human(cfg.get("type_interval_s", [0.03, 0.09]),
-                       cfg.get("action_delay_s", [0.6, 1.6]))
+                       cfg.get("action_delay_s", [0.6, 1.6]),
+                       guard=self.guard)
         self._title_before_detail = None
         self._last_saved = ""
         self._warned_offset = False
@@ -64,6 +78,10 @@ class IbosAutomation:
         # 后台导出状态(供 GUI 轮询检查)
         self._export_status = "pending"   # pending | ok | failed
 
+    def _on_guard_state(self, state: str) -> None:
+        """守卫状态回调:同步到实例属性,供 GUI 轮询显示「暂停中」。"""
+        self.guard_state = state
+
     # ---------------------------------------------------------------- 入口
     def run_all(self, names: list[str], start_index: int = 0) -> None:
         stats = {
@@ -71,8 +89,9 @@ class IbosAutomation:
             "end": "", "duration_s": 0.0,
             "processed": 0, "ok": 0, "fail": 0,
             "orders": 0, "files_ok": 0, "files_total": 0,
-            "per_name": [], "status_dist": {},
+            "per_name": [], "status_dist": {}, "fatal_events": [],
             "xlsx": "", "report": "", "out_dir": "",
+            "pauses": 0, "pause_s": 0.0,
         }
         self._stats = stats
         stats["query_order"] = [n.strip() for n in names if n.strip()]   # 名单顺序(导出按此排)
@@ -130,12 +149,21 @@ class IbosAutomation:
         self.h.pause(0.2, 0.4)
         self._first_query = True   # 首条查询前自动点击「重置」按钮清空页面状态
 
-        for i in range(start_index, len(names)):
+        # 不停止策略:单条失败默认跳过继续;只有「连续失败达阈值」或「停止指令」才结束
+        # stop_on_error=true 时退化为"任一失败即停"(max_consec=1);否则走熔断阈值
+        if self.cfg.get("stop_on_error", False):
+            max_consec = 1
+        else:
+            max_consec = max(1, int(self.cfg.get("max_consecutive_failures", 10)))
+        consec_fail = 0
+        i = start_index
+        while i < len(names):
             if self._stopped():
                 self.log.warn("收到停止指令,任务中断")
                 break
             name = names[i].strip()
             if not name:
+                i += 1
                 continue
             self.log.progress(f"[{i + 1}/{len(names)}] 查询: {name}")
             item = {"name": name, "ok": False, "error": "", "file": "", "orders": 0}
@@ -144,22 +172,60 @@ class IbosAutomation:
                 self._write_progress(i + 1, name, len(names))
                 item["ok"] = True
                 item["file"] = self._last_saved or ""
+                consec_fail = 0
                 self.log.ok(f"[{i + 1}/{len(names)}] {name} 完成")
+            except InterventionAbort as e:
+                # 暂停等待期间用户点了停止 / 等待超时
+                self.log.warn(f"任务已停止: {e}")
+                break
+            except InterventionPause:
+                # 介入暂停后已恢复:当前任务完整重做,不计入失败、不前进索引
+                self.log.info(f"[{i + 1}/{len(names)}] {name} 介入后重做(不计入失败)")
+                continue
+            except pyautogui.FailSafeException:
+                # 鼠标被甩到屏幕角落(紧急制动):转为暂停等待,不崩溃、不前进
+                self.log.warn("⏸ 触发紧急制动(鼠标移到屏幕角落)→ 暂停等待人工")
+                try:
+                    self.guard.pause_manual("紧急制动:鼠标移动到屏幕角落")
+                except InterventionPause:
+                    pass        # 恢复后重做当前任务
+                self.log.info(f"[{i + 1}/{len(names)}] {name} 制动后重做(不计入失败)")
+                continue
+            except FatalError as e:
+                # 环境级故障(Edge 被关闭等):等待人工恢复后重试当前这条,不前进索引
+                # 单独记入 fatal_events,不占用 per_name(避免同一条被计两次)
+                self.log.error(f"[{i + 1}/{len(names)}] {name} 环境异常: {e}")
+                stats["fatal_events"].append({"name": name, "error": str(e)[:200]})
+                if not self._wait_recovery(str(e)):
+                    self.log.error("恢复未成功,任务结束(可稍后「从上次进度继续」)")
+                    break
+                self.log.info(f"环境已恢复,重试 [{i + 1}/{len(names)}] {name}")
+                continue
             except Exception as e:
+                consec_fail += 1
                 item["error"] = str(e)[:200]
                 self.log.error(f"[{i + 1}/{len(names)}] {name} 失败: {e}")
-                if self.cfg.get("stop_on_error", True):
-                    self.log.warn("stop_on_error=true → 已停止。处理问题后可「从上次进度继续」")
+                if consec_fail >= max_consec:
+                    self.log.error(
+                        f"连续失败 {consec_fail} 次(阈值 {max_consec}),"
+                        f"疑似页面结构变化或登录失效 → 停止。可处理后「从上次进度继续」")
                     stats["per_name"].append(item)
                     break
+                self.log.warn(f"跳过该条,继续下一个(连续失败 {consec_fail}/{max_consec})")
             stats["per_name"].append(item)
+            i += 1
 
         stats["processed"] = len(stats["per_name"])
         stats["ok"] = sum(1 for x in stats["per_name"] if x["ok"])
         stats["fail"] = stats["processed"] - stats["ok"]
+        stats["pauses"] = self.guard.pause_count
+        stats["pause_s"] = round(self.guard.total_pause_s, 1)
         stats["end"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         stats["duration_s"] = round(time.time() - t0, 1)
         self.log.info("=== 批量查询结束 ===")
+        if stats["pauses"]:
+            self.log.info(f"期间因检测到人工操作自动暂停 {stats['pauses']} 次, "
+                          f"累计 {stats['pause_s']} 秒")
         self._finalize(stats)
 
     def _finalize(self, stats):
@@ -355,11 +421,45 @@ class IbosAutomation:
 
         self.h.pause(0.2, 0.4)
 
+    # ------------------------------------------------------------ 等待恢复
+    def _wait_recovery(self, reason: str) -> bool:
+        """致命错误(如 Edge 被关闭)后等待人工恢复。
+
+        返回 True=环境已恢复(可重试当前这条,不前进索引);
+        False=收到停止指令(结束整批,可稍后「从上次进度继续」)。
+
+        - 每 recovery_poll_s 秒检查一次 Edge 是否重新运行,期间不消耗任何鼠标/键盘
+        - 响应外部停止指令(用户点「停止」) → 立即返回 False
+        - 不依赖用户介入守卫:恢复阶段本就期望人来处理,故守卫不介入
+        """
+        self.guard_state = "paused"
+        self.log.warn(f"⏸ 环境异常,进入等待恢复: {reason}")
+        self.log.warn("修复后(如重新打开 Edge 并登录 IBOS 查询页)将自动继续;或点「停止」结束本批")
+        self._notify("自动化已暂停", f"{reason}。修复后自动继续;或点「停止」结束")
+        try:
+            t0 = time.time()
+            interval = max(2.0, float(self.cfg.get("recovery_poll_s", 10)))
+            while True:
+                if self._stopped():
+                    self.log.warn("等待恢复期间收到停止指令,结束本批")
+                    return False
+                if mac_perms.edge_running() is True:
+                    self.log.ok("环境已恢复(Edge 重新运行),准备重试当前条目")
+                    time.sleep(1.0)
+                    self.guard.sync()       # 重新同步基准,避免把修复操作误判为介入
+                    return True
+                if (time.time() - t0) >= interval:
+                    self.log.info(f"仍在等待环境恢复…(已 {int(time.time() - t0)}s,可随时修复后自动继续)")
+                    t0 = time.time()
+                time.sleep(2.0)
+        finally:
+            self.guard_state = "running"
+
     def _ensure_page(self):
-        """确保 Edge 在运行且在前台。Edge 崩溃/被关闭时明确停止,不继续盲点。"""
+        """确保 Edge 在运行且在前台。Edge 崩溃/被关闭时抛 FatalError,由上层进入「等待人工恢复」。"""
         if mac_perms.edge_running() is False:
-            raise RuntimeError(
-                "Microsoft Edge 未在运行!请打开 Edge 并登录 IBOS 查询页后,再点「开始」(可从上次进度继续)")
+            raise FatalError(
+                "Microsoft Edge 未在运行!请打开 Edge 并登录 IBOS 查询页后,工具会自动继续")
         if mac_perms.frontmost_app_name() != self.cfg.get("browser", "Microsoft Edge"):
             mac_perms.activate_app(self.cfg.get("browser", "Microsoft Edge"))
         self.h.pause(0.15, 0.3)
@@ -465,6 +565,7 @@ class IbosAutomation:
         while time.time() - t0 < self.cfg.get("max_wait_s", 15):
             if self._stopped():
                 break
+            self.guard.check()        # 画面变化等待期间若有人介入,立即暂停
             time.sleep(0.5)
             try:
                 if grab() != base:
